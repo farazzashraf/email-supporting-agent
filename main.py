@@ -178,8 +178,8 @@ async def process_email_with_gemini(business_name: str, faq_text: str, message: 
 
 async def perform_sync(config: dict, state: dict) -> dict:
     """Performs a single sync of a Gmail inbox."""
-    gmail_user = config.get("gmail_address")
-    gmail_pass = config.get("gmail_app_password")
+    gmail_user = config.get("gmail_address", "").strip()
+    gmail_pass = config.get("gmail_app_password", "").replace(" ", "").strip()
     business_name = config.get("business_name", "the business")
     faq_text = config.get("faq_text", "")
     tenant_id = config.get("tenant_id")
