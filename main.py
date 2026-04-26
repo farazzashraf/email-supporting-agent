@@ -217,5 +217,6 @@ async def handle_chat(payload: ChatRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    # The Developer's Agent runs on Port 8001
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    # Use PORT environment variable if available (required for Cloud Run)
+    port = int(os.getenv("PORT", 8001))
+    uvicorn.run(app, host="0.0.0.0", port=port)

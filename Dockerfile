@@ -11,8 +11,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the agent code
 COPY . .
 
-# Expose the port the app runs on
-EXPOSE 8001
+# Expose the port (Cloud Run will override this via the PORT env var)
+EXPOSE 8080
 
-# Command to run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+# Command to run the application using the PORT environment variable
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8001}"]
