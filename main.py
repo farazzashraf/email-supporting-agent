@@ -113,10 +113,19 @@ class RAGConfigResponse(BaseModel):
 
 def _get_genai_client() -> genai.Client | None:
     api_key = os.getenv("GEMINI_API_KEY")
+    base_url = os.getenv("GEMINI_BASE_URL")
+    
     if not api_key:
         logger.error("GEMINI_API_KEY is not set.")
         return None
-    return genai.Client(api_key=api_key)
+    
+    # If a base URL is provided, configure the client to use it as a proxy
+    http_options = None
+    if base_url:
+        logger.info(f"Using custom GEMINI_BASE_URL: {base_url}")
+        http_options = types.HttpOptions(base_url=base_url)
+        
+    return genai.Client(api_key=api_key, http_options=http_options)
 
 
 async def get_embeddings(text: str) -> list[float]:
