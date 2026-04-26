@@ -11,3 +11,4 @@ chromadb
 pypdf
 python-docx
 openpyxl
+python-multipart

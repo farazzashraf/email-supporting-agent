@@ -59,8 +59,15 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 # ── ChromaDB Initialization ─────────────────────────────────────────────────
 # Use /tmp for writable ephemeral storage in Cloud Run
 CHROMA_DATA_PATH = os.path.join("/tmp", "chroma_data")
-os.makedirs(CHROMA_DATA_PATH, exist_ok=True)
-chroma_client = chromadb.PersistentClient(path=CHROMA_DATA_PATH)
+_chroma_client = None
+
+def get_chroma_client():
+    global _chroma_client
+    if _chroma_client is None:
+        logger.info(f"Initializing ChromaDB at {CHROMA_DATA_PATH}...")
+        os.makedirs(CHROMA_DATA_PATH, exist_ok=True)
+        _chroma_client = chromadb.PersistentClient(path=CHROMA_DATA_PATH)
+    return _chroma_client
 
 # Polling state per Gmail account
 STATE: dict = {}
@@ -314,7 +321,8 @@ def _chunk_fixed_size(text: str, max_words: int, overlap_words: int) -> list[str
 async def get_retrieved_context(tenant_id: str, query: str, n_results: int = 5) -> str:
     """Search the tenant's vector collection for relevant knowledge chunks."""
     try:
-        collection = chroma_client.get_or_create_collection(name=f"tenant_{tenant_id}")
+        client = get_chroma_client()
+        collection = client.get_or_create_collection(name=f"tenant_{tenant_id}")
 
         if collection.count() == 0:
             return ""
@@ -433,70 +441,87 @@ async def poll_once(config: dict) -> None:
         STATE[gmail_user] = {"last_processed_uid": None}
 
     try:
-        mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
-        mail.login(gmail_user, gmail_pass)
-        mail.select("INBOX")
+        def _imap_polling():
+            mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+            mail.login(gmail_user, gmail_pass)
+            mail.select("INBOX")
 
-        if STATE[gmail_user]["last_processed_uid"] is None:
-            status, data = mail.uid("SEARCH", None, "ALL")
-            uids = [int(u) for u in data[0].split()] if (status == "OK" and data[0]) else []
-            STATE[gmail_user]["last_processed_uid"] = max(uids) if uids else 0
+            if STATE[gmail_user]["last_processed_uid"] is None:
+                status, data = mail.uid("SEARCH", None, "ALL")
+                uids = [int(u) for u in data[0].split()] if (status == "OK" and data[0]) else []
+                last_uid = max(uids) if uids else 0
+                mail.close()
+                mail.logout()
+                return last_uid, []
+
+            search_criteria = f"UNSEEN UID {STATE[gmail_user]['last_processed_uid'] + 1}:*"
+            status, messages = mail.uid("SEARCH", None, search_criteria)
+            
+            if status != "OK" or not messages[0]:
+                mail.close()
+                mail.logout()
+                return None, []
+
+            found_uids = messages[0].split()
+            emails_data = []
+            for e_uid in found_uids:
+                status, msg_data = mail.uid("FETCH", e_uid, "(RFC822)")
+                for response_part in msg_data:
+                    if isinstance(response_part, tuple):
+                        emails_data.append((int(e_uid), response_part[1]))
+                
+                # Mark as seen immediately after fetching to avoid re-processing if later steps fail
+                mail.uid("STORE", e_uid, "+FLAGS", "\\Seen")
+
             mail.close()
             mail.logout()
+            return None, emails_data
+
+        last_uid_update, fetched_emails = await asyncio.to_thread(_imap_polling)
+        
+        if last_uid_update is not None:
+            STATE[gmail_user]["last_processed_uid"] = last_uid_update
             return
 
-        search_criteria = f"UNSEEN UID {STATE[gmail_user]['last_processed_uid'] + 1}:*"
-        status, messages = mail.uid("SEARCH", None, search_criteria)
+        for uid_int, raw_email in fetched_emails:
+            msg = email.message_from_bytes(raw_email)
+            sender = msg.get("From")
+            subject = msg.get("Subject", "")
 
-        if status != "OK" or not messages[0]:
-            mail.close()
-            mail.logout()
-            return
-
-        for e_uid in messages[0].split():
-            uid_int = int(e_uid)
-            status, msg_data = mail.uid("FETCH", e_uid, "(RFC822)")
-
-            for response_part in msg_data:
-                if isinstance(response_part, tuple):
-                    msg = email.message_from_bytes(response_part[1])
-                    sender = msg.get("From")
-                    subject = msg.get("Subject", "")
-
-                    body = ""
-                    if msg.is_multipart():
-                        for part in msg.walk():
-                            if part.get_content_type() == "text/plain":
-                                body_bytes = part.get_payload(decode=True)
-                                body = body_bytes.decode(errors="replace") if body_bytes else ""
-                                break
-                    else:
-                        body_bytes = msg.get_payload(decode=True)
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        body_bytes = part.get_payload(decode=True)
                         body = body_bytes.decode(errors="replace") if body_bytes else ""
+                        break
+            else:
+                body_bytes = msg.get_payload(decode=True)
+                body = body_bytes.decode(errors="replace") if body_bytes else ""
 
-                    if not body.strip():
-                        continue
+            if not body.strip():
+                continue
 
-                    reply_text = await process_email_with_gemini(
-                        business_name, faq_text, body.strip(), tenant_id=tenant_id
-                    )
+            reply_text = await process_email_with_gemini(
+                business_name, faq_text, body.strip(), tenant_id=tenant_id
+            )
 
-                    smtp_msg = MIMEText(reply_text)
-                    smtp_msg["Subject"] = f"Re: {subject}"
-                    smtp_msg["From"] = gmail_user
-                    smtp_msg["To"] = sender
+            def _send_reply(r_text, r_sender, r_subject):
+                smtp_msg = MIMEText(r_text)
+                smtp_msg["Subject"] = f"Re: {r_subject}"
+                smtp_msg["From"] = gmail_user
+                smtp_msg["To"] = r_sender
 
-                    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtpserver:
-                        smtpserver.login(gmail_user, gmail_pass)
-                        smtpserver.send_message(smtp_msg)
+                with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtpserver:
+                    smtpserver.login(gmail_user, gmail_pass)
+                    smtpserver.send_message(smtp_msg)
 
-            mail.uid("STORE", e_uid, "+FLAGS", "\\Seen")
+            await asyncio.to_thread(_send_reply, reply_text, sender, subject)
+
             STATE[gmail_user]["last_processed_uid"] = max(
                 STATE[gmail_user]["last_processed_uid"], uid_int
             )
 
-        mail.close()
-        mail.logout()
     except Exception as e:
         logger.error(f"Polling error for {gmail_user}: {e}")
 
@@ -576,7 +601,8 @@ async def index_knowledge(payload: KnowledgePayload):
     Applies smart chunking before embedding.
     """
     try:
-        collection = chroma_client.get_or_create_collection(name=f"tenant_{payload.tenant_id}")
+        client = get_chroma_client()
+        collection = client.get_or_create_collection(name=f"tenant_{payload.tenant_id}")
 
         # Chunk the content
         chunks = chunk_text(
@@ -670,7 +696,8 @@ async def upload_file(
     # Chunk and index
     chunks = chunk_text(text, strategy=chunk_strategy, max_chunk_words=400, overlap_words=50)
 
-    collection = chroma_client.get_or_create_collection(name=f"tenant_{tenant_id}")
+    client = get_chroma_client()
+    collection = client.get_or_create_collection(name=f"tenant_{tenant_id}")
     indexed = 0
 
     for i, chunk in enumerate(chunks):

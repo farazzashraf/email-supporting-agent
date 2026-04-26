@@ -28,4 +28,4 @@ EXPOSE 8080
 
 # Command to run the application using the PORT environment variable
 # We use the shell form to allow environment variable expansion
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
+CMD ["python", "main.py"]
