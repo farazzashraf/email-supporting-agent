@@ -297,9 +297,100 @@ def extract_text(content: bytes, filename: str) -> str:
     if ext.endswith(".xlsx") or ext.endswith(".xls"): return extract_text_from_xlsx(content)
     return content.decode("utf-8", errors="replace")
 
-def chunk_text(text: str, strategy: str = "paragraph", max_words: int = 400, overlap: int = 50) -> list[str]:
+def chunk_text(text: str, strategy: str = "paragraph", max_chunk_words: int = 400, overlap_words: int = 50) -> list[str]:
+    """
+    Split text into chunks for embedding.
+    Strategies: paragraph, sentence, fixed_size
+    """
+    if not text or not text.strip():
+        return []
+
+    if strategy == "sentence":
+        return _chunk_by_sentence(text, max_chunk_words, overlap_words)
+    elif strategy == "fixed_size":
+        return _chunk_fixed_size(text, max_chunk_words, overlap_words)
+    else:
+        return _chunk_by_paragraph(text, max_chunk_words, overlap_words)
+
+
+def _chunk_by_paragraph(text: str, max_words: int, overlap_words: int) -> list[str]:
+    """Split on paragraph boundaries, merge short paragraphs."""
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    return paragraphs # Simplified for now
+    chunks = []
+    current_chunk: list[str] = []
+    current_word_count = 0
+
+    for para in paragraphs:
+        para_words = len(para.split())
+        if para_words > max_words:
+            if current_chunk:
+                chunks.append("\n\n".join(current_chunk))
+                current_chunk = []
+                current_word_count = 0
+            chunks.extend(_chunk_fixed_size(para, max_words, overlap_words))
+            continue
+
+        if current_word_count + para_words > max_words and current_chunk:
+            chunks.append("\n\n".join(current_chunk))
+            if overlap_words > 0:
+                last_para = current_chunk[-1]
+                current_chunk = [last_para]
+                current_word_count = len(last_para.split())
+            else:
+                current_chunk = []
+                current_word_count = 0
+
+        current_chunk.append(para)
+        current_word_count += para_words
+
+    if current_chunk:
+        chunks.append("\n\n".join(current_chunk))
+    return chunks
+
+
+def _chunk_by_sentence(text: str, max_words: int, overlap_words: int) -> list[str]:
+    """Split on sentence boundaries (. ! ?)."""
+    import re
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks = []
+    current: list[str] = []
+    current_words = 0
+
+    for sentence in sentences:
+        s_words = len(sentence.split())
+        if current_words + s_words > max_words and current:
+            chunks.append(" ".join(current))
+            overlap_text = " ".join(current)
+            overlap_split = overlap_text.split()
+            if overlap_words > 0 and len(overlap_split) > overlap_words:
+                carry = " ".join(overlap_split[-overlap_words:])
+                current = [carry]
+                current_words = overlap_words
+            else:
+                current = []
+                current_words = 0
+        current.append(sentence)
+        current_words += s_words
+
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def _chunk_fixed_size(text: str, max_words: int, overlap_words: int) -> list[str]:
+    """Fixed-size word windows with overlap."""
+    words = text.split()
+    chunks = []
+    i = 0
+    while i < len(words):
+        end = min(i + max_words, len(words))
+        chunk = " ".join(words[i:end])
+        if chunk.strip():
+            chunks.append(chunk)
+        i += max_words - overlap_words
+        if i >= len(words):
+            break
+    return chunks
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTES
@@ -314,6 +405,11 @@ async def handle_sync(payload: SyncRequest):
     updated_state = await perform_sync(payload.config, payload.state)
     return {"status": "success", "state": updated_state}
 
+@app.post("/install")
+async def handle_install():
+    """Triggered by the Gateway as a wake-up signal."""
+    return {"status": "ok", "message": "Agent woken up."}
+
 @app.post("/")
 async def handle_chat(payload: ChatRequest):
     config = payload.injected_context
@@ -322,15 +418,63 @@ async def handle_chat(payload: ChatRequest):
 
 @app.post("/index-knowledge")
 async def index_knowledge(payload: KnowledgePayload):
-    client = get_chroma_client()
-    collection = client.get_or_create_collection(name=f"tenant_{payload.tenant_id}")
-    chunks = chunk_text(payload.content)
-    for i, chunk in enumerate(chunks):
-        embedding = await get_embeddings(chunk)
-        if embedding:
-            doc_id = f"doc_{payload.tenant_id[:8]}_{hashlib.sha256(chunk.encode()).hexdigest()[:16]}"
-            collection.upsert(ids=[doc_id], embeddings=[embedding], documents=[chunk], metadatas=[{"chunk_index": i}])
-    return {"status": "success", "chunks": len(chunks)}
+    """
+    Indexes text content into the tenant's ChromaDB collection.
+    Applies smart chunking before embedding.
+    """
+    try:
+        client = get_chroma_client()
+        collection = client.get_or_create_collection(name=f"tenant_{payload.tenant_id}")
+
+        # Chunk the content
+        chunks = chunk_text(
+            payload.content,
+            strategy=payload.chunk_strategy,
+            max_chunk_words=400,
+            overlap_words=50,
+        )
+
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No meaningful text to index after chunking.")
+
+        indexed_ids = []
+        for i, chunk in enumerate(chunks):
+            embedding = await get_embeddings(chunk)
+            if not embedding:
+                logger.warning(f"Skipping chunk {i} — embedding failed.")
+                continue
+
+            # Deterministic ID based on content hash for idempotency
+            content_hash = hashlib.sha256(chunk.encode()).hexdigest()[:16]
+            doc_id = f"doc_{payload.tenant_id[:8]}_{content_hash}"
+
+            collection.upsert(
+                ids=[doc_id],
+                embeddings=[embedding],
+                documents=[chunk],
+                metadatas=[{
+                    **payload.metadata,
+                    "chunk_index": i,
+                    "total_chunks": len(chunks),
+                    "indexed_at": time.time(),
+                }],
+            )
+            indexed_ids.append(doc_id)
+
+        logger.info(
+            f"Indexed {len(indexed_ids)}/{len(chunks)} chunks for tenant {payload.tenant_id}"
+        )
+        return {
+            "status": "success",
+            "chunks_indexed": len(indexed_ids),
+            "total_chunks": len(chunks),
+            "doc_ids": indexed_ids,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Indexing error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/upload-file")
 async def upload_file(tenant_id: str = Form(...), file: UploadFile = File(...)):
