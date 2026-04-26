@@ -35,6 +35,11 @@ class InstallRequest(BaseModel):
 AGENT_ID = os.getenv("AGENT_ID", "default_agent")
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://gateway:8000")
 
+# Define the expected JSON payload for Chat (from Gateway)
+class ChatRequest(BaseModel):
+    message: str
+    injected_context: dict = {}
+
 # Local memory to track state if using webhook / pushing
 STATE = {}
 
@@ -193,6 +198,22 @@ async def handle_install(payload: InstallRequest):
     data = payload.dict()
     logger.info(f"Received manual push installation for {data.get('gmail_address')}")
     return {"status": "installed"}
+
+@app.post("/")
+async def handle_chat(payload: ChatRequest):
+    """
+    Standard chat endpoint called by the Agent-fy Gateway.
+    It uses the injected context (Business Name, FAQ) to respond.
+    """
+    logger.info(f"Received chat request: {payload.message}")
+    
+    # Extract config from injected context
+    config = payload.injected_context
+    business_name = config.get("business_name", config.get("restaurant_name", "the business"))
+    faq_text = config.get("faq_text", "")
+    
+    reply = process_email_with_gemini(business_name, faq_text, payload.message)
+    return {"reply": reply}
 
 if __name__ == "__main__":
     import uvicorn
