@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import time
 import imaplib
 import smtplib
 import email
@@ -11,6 +12,8 @@ from pydantic import BaseModel
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
+import chromadb
+from chromadb.config import Settings as ChromaSettings
 
 import logging
 
@@ -43,7 +46,67 @@ class ChatRequest(BaseModel):
 # Local memory to track state if using webhook / pushing
 STATE = {}
 
-def process_email_with_gemini(business_name, faq_text, message):
+# ── ChromaDB Initialization ──────────────────────────────────────────────────
+# We use a local persistent directory for the vector database
+CHROMA_DATA_PATH = os.path.join(os.getcwd(), "chroma_data")
+os.makedirs(CHROMA_DATA_PATH, exist_ok=True)
+
+chroma_client = chromadb.PersistentClient(path=CHROMA_DATA_PATH)
+
+def get_embedding_model():
+    """Helper to call Gemini for embeddings."""
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    if not GEMINI_API_KEY:
+        return None
+    return genai.Client(api_key=GEMINI_API_KEY)
+
+async def get_embeddings(text: str):
+    """Generates embeddings using gemini-embedding-2."""
+    client = get_embedding_model()
+    if not client:
+        return []
+    
+    try:
+        response = client.models.embed_content(
+            model='gemini-embedding-2',
+            contents=text
+        )
+        return response.embeddings[0].values
+    except Exception as e:
+        logger.error(f"Embedding error: {e}")
+        return []
+
+def get_retrieved_context(tenant_id: str, query: str, n_results: int = 3):
+    """Searches the vector database for relevant snippets."""
+    try:
+        collection = chroma_client.get_or_create_collection(name=f"tenant_{tenant_id}")
+        
+        # In a real app, we would use an embedding function in ChromaDB
+        # For now, we'll do it manually to ensure we use gemini-embedding-2
+        query_embedding = asyncio.run(get_embeddings(query))
+        
+        if not query_embedding:
+            return ""
+            
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=n_results
+        )
+        
+        if not results['documents'] or not results['documents'][0]:
+            return ""
+            
+        return "\n\nRelevant Context:\n" + "\n".join(results['documents'][0])
+    except Exception as e:
+        logger.error(f"Retrieval error: {e}")
+        return ""
+
+class KnowledgePayload(BaseModel):
+    tenant_id: str
+    content: str
+    metadata: dict = {}
+
+def process_email_with_gemini(business_name, faq_text, message, tenant_id=None):
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL") # Support for proxy
     
@@ -59,10 +122,16 @@ def process_email_with_gemini(business_name, faq_text, message):
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     
+    # Retrieve extra context from Vector DB if tenant_id is provided
+    vector_context = ""
+    if tenant_id:
+        vector_context = get_retrieved_context(tenant_id, message)
+
     system_prompt = (
         f"You are a helpful AI assistant for {business_name}. "
         f"Use the following business information to answer the user's inquiry:\n\n"
-        f"FAQ/Information:\n{faq_text}\n\n"
+        f"FAQ/Information:\n{faq_text}\n"
+        f"{vector_context}\n\n"
         f"Guidelines:\n"
         f"- Be polite and professional.\n"
         f"- If you don't know the answer, ask the user to contact us directly or wait for a human representative.\n"
@@ -148,7 +217,10 @@ def poll_once(config):
                     if not body.strip(): continue
 
                     # Execute Agent Brain
-                    reply_text = process_email_with_gemini(business_name, faq_text, body.strip())
+                    # For email polling, we might not have the tenant_id easily accessible in this loop
+                    # unless we pass it from agent_polling_loop.
+                    # Let's assume we pass it or resolve it.
+                    reply_text = process_email_with_gemini(business_name, faq_text, body.strip(), tenant_id=config.get("tenant_id"))
                         
                     # Send SMTP
                     smtp_msg = MIMEText(reply_text)
@@ -211,9 +283,36 @@ async def handle_chat(payload: ChatRequest):
     config = payload.injected_context
     business_name = config.get("business_name", config.get("restaurant_name", "the business"))
     faq_text = config.get("faq_text", "")
+    tenant_id = config.get("tenant_id")
     
-    reply = process_email_with_gemini(business_name, faq_text, payload.message)
+    reply = process_email_with_gemini(business_name, faq_text, payload.message, tenant_id=tenant_id)
     return {"reply": reply}
+
+@app.post("/index-knowledge")
+async def index_knowledge(payload: KnowledgePayload):
+    """
+    Indexes text content into the tenant's vector database.
+    """
+    try:
+        collection = chroma_client.get_or_create_collection(name=f"tenant_{payload.tenant_id}")
+        
+        embedding = await get_embeddings(payload.content)
+        if not embedding:
+            raise HTTPException(status_code=500, detail="Failed to generate embedding")
+            
+        doc_id = f"doc_{int(time.time() * 1000)}"
+        collection.add(
+            ids=[doc_id],
+            embeddings=[embedding],
+            documents=[payload.content],
+            metadatas=[payload.metadata]
+        )
+        
+        logger.info(f"Indexed content for tenant {payload.tenant_id}: {doc_id}")
+        return {"status": "success", "doc_id": doc_id}
+    except Exception as e:
+        logger.error(f"Indexing error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
