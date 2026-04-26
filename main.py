@@ -57,7 +57,8 @@ GATEWAY_URL = os.getenv("GATEWAY_URL", "http://gateway:8000")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # ── ChromaDB Initialization ─────────────────────────────────────────────────
-CHROMA_DATA_PATH = os.path.join(os.getcwd(), "chroma_data")
+# Use /tmp for writable ephemeral storage in Cloud Run
+CHROMA_DATA_PATH = os.path.join("/tmp", "chroma_data")
 os.makedirs(CHROMA_DATA_PATH, exist_ok=True)
 chroma_client = chromadb.PersistentClient(path=CHROMA_DATA_PATH)
 
@@ -310,7 +311,7 @@ def _chunk_fixed_size(text: str, max_words: int, overlap_words: int) -> list[str
 # VECTOR RETRIEVAL
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_retrieved_context(tenant_id: str, query: str, n_results: int = 5) -> str:
+async def get_retrieved_context(tenant_id: str, query: str, n_results: int = 5) -> str:
     """Search the tenant's vector collection for relevant knowledge chunks."""
     try:
         collection = chroma_client.get_or_create_collection(name=f"tenant_{tenant_id}")
@@ -318,7 +319,7 @@ def get_retrieved_context(tenant_id: str, query: str, n_results: int = 5) -> str
         if collection.count() == 0:
             return ""
 
-        query_embedding = asyncio.run(get_embeddings(query))
+        query_embedding = await get_embeddings(query)
         if not query_embedding:
             return ""
 
@@ -350,7 +351,7 @@ def get_retrieved_context(tenant_id: str, query: str, n_results: int = 5) -> str
 # LLM — Gemini 2.5 Flash
 # ══════════════════════════════════════════════════════════════════════════════
 
-def process_email_with_gemini(
+async def process_email_with_gemini(
     business_name: str,
     faq_text: str,
     message: str,
@@ -364,7 +365,7 @@ def process_email_with_gemini(
     # RAG retrieval
     vector_context = ""
     if tenant_id:
-        vector_context = get_retrieved_context(tenant_id, message)
+        vector_context = await get_retrieved_context(tenant_id, message)
 
     system_prompt = (
         f"You are a professional AI support assistant for **{business_name}**.\n\n"
@@ -417,7 +418,7 @@ def process_email_with_gemini(
 # EMAIL POLLING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def poll_once(config: dict) -> None:
+async def poll_once(config: dict) -> None:
     """Poll a single Gmail inbox for new emails and auto-reply."""
     gmail_user = config.get("gmail_address")
     gmail_pass = config.get("gmail_app_password")
@@ -476,7 +477,7 @@ def poll_once(config: dict) -> None:
                     if not body.strip():
                         continue
 
-                    reply_text = process_email_with_gemini(
+                    reply_text = await process_email_with_gemini(
                         business_name, faq_text, body.strip(), tenant_id=tenant_id
                     )
 
@@ -514,7 +515,7 @@ async def agent_polling_loop() -> None:
                 if res.status_code == 200:
                     tenants = res.json().get("tenants", [])
                     for tenant in tenants:
-                        await asyncio.to_thread(poll_once, tenant)
+                        await poll_once(tenant)
         except Exception:
             pass  # Keep running quietly even if gateway is temporarily down
 
@@ -522,6 +523,16 @@ async def agent_polling_loop() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/")
+async def root():
+    """Health check endpoint for Cloud Run."""
+    return {
+        "status": "Email Support Agent is healthy",
+        "agent_id": AGENT_ID,
+        "version": "2.0.0"
+    }
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -554,7 +565,7 @@ async def handle_chat(payload: ChatRequest):
     faq_text = config.get("faq_text", "")
     tenant_id = config.get("tenant_id")
 
-    reply = process_email_with_gemini(business_name, faq_text, payload.message, tenant_id=tenant_id)
+    reply = await process_email_with_gemini(business_name, faq_text, payload.message, tenant_id=tenant_id)
     return {"reply": reply}
 
 
