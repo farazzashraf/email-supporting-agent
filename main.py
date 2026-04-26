@@ -452,7 +452,9 @@ async def poll_once(config: dict) -> None:
     try:
         def _imap_polling():
             mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+            logger.info(f"Attempting IMAP login for {gmail_user}...")
             mail.login(gmail_user, gmail_pass)
+            logger.info(f"IMAP login successful for {gmail_user}")
             mail.select("INBOX")
 
             if STATE[gmail_user]["last_processed_uid"] is None:
@@ -464,6 +466,7 @@ async def poll_once(config: dict) -> None:
                 return last_uid, []
 
             search_criteria = f"UNSEEN UID {STATE[gmail_user]['last_processed_uid'] + 1}:*"
+            logger.info(f"Searching for emails with criteria: {search_criteria}")
             status, messages = mail.uid("SEARCH", None, search_criteria)
             
             if status != "OK" or not messages[0]:
@@ -489,8 +492,15 @@ async def poll_once(config: dict) -> None:
         last_uid_update, fetched_emails = await asyncio.to_thread(_imap_polling)
         
         if last_uid_update is not None:
+            logger.info(f"Initialized polling for {gmail_user}. Last UID: {last_uid_update}")
             STATE[gmail_user]["last_processed_uid"] = last_uid_update
             return
+
+        if fetched_emails:
+            logger.info(f"Found {len(fetched_emails)} new emails for {gmail_user}")
+        else:
+            # logger.info(f"No new emails for {gmail_user}")
+            pass
 
         for uid_int, raw_email in fetched_emails:
             msg = email.message_from_bytes(raw_email)
