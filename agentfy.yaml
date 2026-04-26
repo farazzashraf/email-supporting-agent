@@ -1,20 +1,71 @@
-# Agent-fy Deployment Manifest
+# ─────────────────────────────────────────────────────────────
+# Agent-fy Deployment Manifest — Email Support Agent
+# ─────────────────────────────────────────────────────────────
 agent:
   name: "Email Support Agent"
-  description: "An AI-powered agent that monitors your Gmail inbox and automatically replies to customer inquiries using your business FAQ."
+  description: >-
+    An AI-powered agent that monitors your Gmail inbox and automatically
+    replies to customer inquiries using your business knowledge base.
+    Supports PDF, DOCX, XLSX, and plaintext FAQ for RAG-powered responses.
   trigger: "email"
   price: 10.0
   use_managed_db: true
+
+  # ── Agent Interface ──────────────────────────────────────
+  # Tells the platform what kind of experience this agent provides.
+  #   chatbot    → Real-time chat widget (consumer-facing)
+  #   automation → Background task triggered by events (email, schedule, etc.)
+  #   headless   → API-only, no UI needed
+  interface:
+    type: "automation"
+
+  # ── RAG Configuration ────────────────────────────────────
+  # Declares that this agent supports Retrieval-Augmented Generation.
+  # The gateway reads this to decide what file types to accept,
+  # how to chunk documents, and what badges to show in the marketplace.
+  rag:
+    enabled: true
+    vector_store: "chromadb"
+    embedding_model: "gemini-embedding-2"
+    supported_files:
+      - ".pdf"
+      - ".docx"
+      - ".xlsx"
+      - ".txt"
+    allow_text_input: true
+    max_file_size_mb: 10
+    chunk_strategy: "paragraph"   # paragraph | sentence | fixed_size
+    chunk_overlap_words: 50
+
+  # ── Config Fields (shown during installation) ────────────
   config_fields:
     - name: "business_name"
       label: "Business Name"
       type: "text"
-    - name: "faq_text"
-      label: "Business FAQ (Services, Hours, etc.)"
-      type: "textarea"
+      required: true
+      description: "Your company or brand name."
+
+    - name: "knowledge_base"
+      label: "Business Knowledge Base"
+      type: "knowledge"
+      required: false
+      description: "Upload documents or paste text containing your FAQ, product info, pricing, policies, etc. This knowledge will be used by the agent to answer customer emails."
+      allow_text: true
+      allow_file: true
+      file_types:
+        - ".pdf"
+        - ".docx"
+        - ".xlsx"
+        - ".txt"
+
     - name: "gmail_address"
       label: "Gmail Address"
       type: "text"
+      required: true
+      description: "The Gmail address the agent will monitor for incoming emails."
+
     - name: "gmail_app_password"
       label: "Gmail App Password"
       type: "password"
+      required: true
+      description: "A Google App Password (not your Gmail password). Generate one at myaccount.google.com/apppasswords."

@@ -9,3 +9,5 @@ firebase-admin
 PyYAML
 chromadb
 pypdf
+python-docx
+openpyxl
