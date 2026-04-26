@@ -548,10 +548,16 @@ async def agent_polling_loop() -> None:
                 )
                 if res.status_code == 200:
                     tenants = res.json().get("tenants", [])
-                    for tenant in tenants:
-                        await poll_once(tenant)
-        except Exception:
-            pass  # Keep running quietly even if gateway is temporarily down
+                    if tenants:
+                        logger.info(f"Fetched {len(tenants)} tenants for polling.")
+                        for tenant in tenants:
+                            await poll_once(tenant)
+                    else:
+                        logger.info("No tenants found for this agent.")
+                else:
+                    logger.error(f"Failed to fetch tenants: {res.status_code} {res.text}")
+        except Exception as e:
+            logger.error(f"Background loop error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
