@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Expose the port (Cloud Run will override this via the PORT env var)
-EXPOSE 8080
+EXPOSE 8001
 
 # Command to run the application using the PORT environment variable
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8001}"]
