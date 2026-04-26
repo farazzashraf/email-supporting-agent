@@ -72,6 +72,12 @@ def get_chroma_client():
 # Polling state per Gmail account
 STATE: dict = {}
 
+# ── Polling Control ──────────────────────────────────────────────────────────
+WAKE_EVENT = asyncio.Event()
+IDLE_THRESHOLD = 60          # Seconds with 0 tenants before going idle
+ACTIVE_CHECK_INTERVAL = 10   # Check tenants every 10s when active
+IDLE_CHECK_INTERVAL = 60     # Check tenants every 60s when idle
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MODELS
@@ -546,10 +552,15 @@ async def poll_once(config: dict) -> None:
 
 
 async def agent_polling_loop() -> None:
-    """Background loop that polls all tenant inboxes."""
+    """
+    Background loop that polls all tenant inboxes.
+    Implements adaptive polling: slows down when idle (no tenants).
+    """
     logger.info("Starting Email Support Agent polling loop...")
+    last_active_time = time.time()
+    is_idle = False
+
     while True:
-        await asyncio.sleep(10)
         try:
             async with httpx.AsyncClient() as client:
                 res = await client.get(
@@ -559,15 +570,38 @@ async def agent_polling_loop() -> None:
                 if res.status_code == 200:
                     tenants = res.json().get("tenants", [])
                     if tenants:
+                        if is_idle:
+                            logger.info("Agent waking up from idle state!")
+                            is_idle = False
+                        
+                        last_active_time = time.time()
                         logger.info(f"Fetched {len(tenants)} tenants for polling.")
                         for tenant in tenants:
                             await poll_once(tenant)
                     else:
-                        logger.info("No tenants found for this agent.")
+                        # No tenants found
+                        if not is_idle and (time.time() - last_active_time > IDLE_THRESHOLD):
+                            logger.info(f"No tenants found for {IDLE_THRESHOLD}s. Entering idle mode (reduced polling).")
+                            is_idle = True
+                        
+                        if not is_idle:
+                            logger.info("No tenants found for this agent.")
                 else:
-                    logger.error(f"Failed to fetch tenants: {res.status_code} {res.text}")
+                    logger.error(f"Failed to fetch tenants: {res.status_code}")
         except Exception as e:
             logger.error(f"Background loop error: {e}")
+
+        # Sleep or Wait for Event
+        interval = IDLE_CHECK_INTERVAL if is_idle else ACTIVE_CHECK_INTERVAL
+        
+        # Clear event before waiting
+        WAKE_EVENT.clear()
+        try:
+            # Wait for either the timeout OR the wake event to be set
+            await asyncio.wait_for(WAKE_EVENT.wait(), timeout=interval)
+        except (asyncio.TimeoutError, TimeoutError):
+            # Normal timeout, just continue loop
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -577,6 +611,7 @@ async def agent_polling_loop() -> None:
 @app.get("/")
 async def root():
     """Health check endpoint for Cloud Run."""
+    WAKE_EVENT.set()  # Any activity wakes up the loop
     return {
         "status": "Email Support Agent is healthy",
         "agent_id": AGENT_ID,
@@ -599,8 +634,9 @@ async def rag_config():
 async def handle_install(payload: InstallRequest):
     """Fallback route for developers who do NOT use managed DB."""
     data = payload.dict()
-    logger.info(f"Received manual installation for {data.get('gmail_address')}")
-    return {"status": "installed"}
+    logger.info(f"Received installation/wake signal for {data.get('gmail_address') or data.get('tenant_id')}")
+    WAKE_EVENT.set()  # Restart loop immediately
+    return {"status": "installed", "message": "Agent woken up and ready."}
 
 
 @app.post("/")
@@ -609,6 +645,7 @@ async def handle_chat(payload: ChatRequest):
     Standard chat endpoint called by the Agent-fy Gateway.
     Uses the injected_context (business config) to generate responses.
     """
+    WAKE_EVENT.set()  # Chat activity wakes up the loop
     logger.info(f"Chat request: {payload.message[:80]}...")
     config = payload.injected_context
     business_name = config.get("business_name", config.get("restaurant_name", "the business"))
@@ -625,6 +662,7 @@ async def index_knowledge(payload: KnowledgePayload):
     Indexes text content into the tenant's ChromaDB collection.
     Applies smart chunking before embedding.
     """
+    WAKE_EVENT.set()
     try:
         client = get_chroma_client()
         collection = client.get_or_create_collection(name=f"tenant_{payload.tenant_id}")
@@ -690,6 +728,7 @@ async def upload_file(
     Accepts a raw file upload, extracts text, chunks it, and indexes into ChromaDB.
     Supports: PDF, DOCX, XLSX, TXT.
     """
+    WAKE_EVENT.set()
     # Validate file extension
     supported = {".pdf", ".docx", ".xlsx", ".xls", ".txt"}
     ext = os.path.splitext(file.filename or "")[1].lower()
