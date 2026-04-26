@@ -1,0 +1,20 @@
+# Agent-fy Deployment Manifest
+agent:
+  name: "Email Support Agent"
+  description: "An AI-powered agent that monitors your Gmail inbox and automatically replies to customer inquiries using your business FAQ."
+  trigger: "email"
+  price: 10.0
+  use_managed_db: true
+  config_fields:
+    - key: "business_name"
+      label: "Business Name"
+      type: "text"
+    - key: "faq_text"
+      label: "Business FAQ (Services, Hours, etc.)"
+      type: "textarea"
+    - key: "gmail_address"
+      label: "Gmail Address"
+      type: "text"
+    - key: "gmail_app_password"
+      label: "Gmail App Password"
+      type: "password"
