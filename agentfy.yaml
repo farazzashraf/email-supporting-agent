@@ -6,15 +6,15 @@ agent:
   price: 10.0
   use_managed_db: true
   config_fields:
-    - key: "business_name"
+    - name: "business_name"
       label: "Business Name"
       type: "text"
-    - key: "faq_text"
+    - name: "faq_text"
       label: "Business FAQ (Services, Hours, etc.)"
       type: "textarea"
-    - key: "gmail_address"
+    - name: "gmail_address"
       label: "Gmail Address"
       type: "text"
-    - key: "gmail_app_password"
+    - name: "gmail_app_password"
       label: "Gmail App Password"
       type: "password"
