@@ -27,19 +27,19 @@ demo_simulation:
   simulated_output_description: "The agent will analyze the email, consult the knowledge base, and draft/send a professional reply."
 
 # 5. Business Onboarding Schema
-required_business_inputs:
+installation_config:
   - field_id: "business_name"
-    label: "Business Name"
+    name: "Business Name"
     type: "text"
     required: true
 
   - field_id: "gmail_address"
-    label: "Gmail Address"
+    name: "Gmail Address"
     type: "text"
     required: true
 
   - field_id: "gmail_app_password"
-    label: "Gmail App Password"
+    name: "Gmail App Password"
     type: "secret"
     required: true
 
