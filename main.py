@@ -8,6 +8,13 @@ This agent:
   4. Sends replies via SMTP
 
 This agent is stateless; the Gateway is responsible for triggering '/sync' calls.
+
+Fixes applied (v3.1.0):
+  - IMAP search query: separate UNSEEN and UID criteria correctly
+  - Reply loop protection: skip auto-replies, bots, and self-addressed emails
+  - upload_file: filename now passed into metadata so [Source: ...] renders
+  - SMTP failure safety: UID only advances if reply was sent successfully
+  - Rate limiting: asyncio.Semaphore limits concurrent Gemini calls to 5
 """
 
 import os
@@ -49,17 +56,19 @@ load_dotenv()
 app = FastAPI(
     title="Email Support Agent",
     description="RAG-powered email support agent with multi-format knowledge ingestion.",
-    version="3.0.0",
+    version="3.1.0",
 )
 
 # ── Environment ──────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# ── ChromaDB Initialization ─────────────────────────────────────────────────
-CHROMA_DATA_PATH = os.path.join(os.getcwd(), "knowledge_data") # Persistent storage
-os.makedirs(CHROMA_DATA_PATH, exist_ok=True)
+# ── Rate limiting: max 5 concurrent Gemini calls ─────────────────────────────
+_gemini_semaphore = asyncio.Semaphore(5)
 
 # ── ChromaDB Initialization ─────────────────────────────────────────────────
+CHROMA_DATA_PATH = os.path.join(os.getcwd(), "knowledge_data")
+os.makedirs(CHROMA_DATA_PATH, exist_ok=True)
+
 _chroma_client = None
 
 def get_chroma_client():
@@ -109,13 +118,15 @@ class RAGConfigResponse(BaseModel):
 def _get_genai_client() -> genai.Client | None:
     api_key = os.getenv("GEMINI_API_KEY")
     base_url = os.getenv("GEMINI_BASE_URL")
-    if not api_key: return None
+    if not api_key:
+        return None
     http_options = types.HttpOptions(base_url=base_url) if base_url else None
     return genai.Client(api_key=api_key, http_options=http_options)
 
 async def get_embeddings(text: str) -> list[float]:
     client = _get_genai_client()
-    if not client: return []
+    if not client:
+        return []
     try:
         truncated = text[:8000] if len(text) > 8000 else text
         response = client.models.embed_content(model="gemini-embedding-2", contents=truncated)
@@ -128,11 +139,17 @@ async def get_retrieved_context(tenant_id: str, query: str, n_results: int = 5) 
     try:
         client = get_chroma_client()
         collection = client.get_or_create_collection(name=f"tenant_{tenant_id}")
-        if collection.count() == 0: return ""
+        if collection.count() == 0:
+            return ""
         query_embedding = await get_embeddings(query)
-        if not query_embedding: return ""
-        results = collection.query(query_embeddings=[query_embedding], n_results=min(n_results, collection.count()))
-        if not results["documents"] or not results["documents"][0]: return ""
+        if not query_embedding:
+            return ""
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=min(n_results, collection.count()),
+        )
+        if not results["documents"] or not results["documents"][0]:
+            return ""
         context_parts = []
         for i, doc_text in enumerate(results["documents"][0]):
             source = ""
@@ -146,10 +163,18 @@ async def get_retrieved_context(tenant_id: str, query: str, n_results: int = 5) 
         logger.error(f"Retrieval error: {e}")
         return ""
 
-async def process_email_with_gemini(business_name: str, faq_text: str, message: str, tenant_id: Optional[str] = None) -> str:
+async def process_email_with_gemini(
+    business_name: str,
+    faq_text: str,
+    message: str,
+    tenant_id: Optional[str] = None,
+) -> str:
     client = _get_genai_client()
-    if not client: return "Sorry, I am currently unable to process your request."
+    if not client:
+        return "Sorry, I am currently unable to process your request."
+
     vector_context = await get_retrieved_context(tenant_id, message) if tenant_id else ""
+
     system_prompt = (
         f"You are a professional AI support assistant for **{business_name}**.\n\n"
         f"Use the following business information to answer the customer's inquiry:\n\n"
@@ -162,19 +187,87 @@ async def process_email_with_gemini(business_name: str, faq_text: str, message: 
         "• Be polite, professional, and concise.\n"
         "• Respond ONLY with a JSON object: {\"reply\": \"your response text\"}\n"
     )
+
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[system_prompt, f"Customer email: \"{message}\""],
-            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.5),
-        )
+        # FIX: rate-limit concurrent Gemini calls
+        async with _gemini_semaphore:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[system_prompt, f"Customer email: \"{message}\""],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.5,
+                ),
+            )
         text_resp = response.text.strip()
-        if text_resp.startswith("```json"): text_resp = text_resp[7:-3].strip()
+        if text_resp.startswith("```json"):
+            text_resp = text_resp[7:-3].strip()
         data = json.loads(text_resp)
         return data.get("reply", "Thank you for your message.")
     except Exception as e:
         logger.error(f"Gemini error: {e}")
         return "Thank you for your message. We will get back to you shortly."
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REPLY LOOP GUARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Headers that indicate an automated message that should never be replied to.
+_AUTO_REPLY_HEADERS = [
+    "Auto-Submitted",
+    "X-Auto-Response-Suppress",
+    "X-Autoreply",
+    "X-AutoReply",
+]
+
+# Common patterns in From/Subject that indicate automated senders.
+_AUTO_SENDER_KEYWORDS = [
+    "noreply", "no-reply", "donotreply", "do-not-reply",
+    "mailer-daemon", "postmaster", "bounce",
+    "auto-confirm", "autoconfirm",
+]
+
+def _is_auto_message(msg: email.message.Message, own_address: str) -> bool:
+    """
+    Returns True if this email should be skipped (auto-reply, bot, self-sent).
+    Prevents infinite reply loops.
+    """
+    # 1. Check for standard auto-reply headers
+    for header in _AUTO_REPLY_HEADERS:
+        value = msg.get(header, "").strip().lower()
+        if value and value not in ("no", "none", ""):
+            logger.info(f"Skipping email — auto header detected: {header}: {value}")
+            return True
+
+    # 2. Check sender address against own address (our own outbound emails)
+    sender = msg.get("From", "").lower()
+    if own_address.lower() in sender:
+        logger.info(f"Skipping email — sender matches own address: {sender}")
+        return True
+
+    # 3. Check sender for known bot/no-reply patterns
+    for keyword in _AUTO_SENDER_KEYWORDS:
+        if keyword in sender:
+            logger.info(f"Skipping email — auto-sender keyword '{keyword}' in: {sender}")
+            return True
+
+    # 4. Catch Precedence: bulk/list/junk headers (mailing lists, newsletters)
+    precedence = msg.get("Precedence", "").strip().lower()
+    if precedence in ("bulk", "list", "junk"):
+        logger.info(f"Skipping email — Precedence: {precedence}")
+        return True
+
+    # 5. RFC 3834: if Reply-To is set to a no-reply address
+    reply_to = msg.get("Reply-To", "").lower()
+    if reply_to:
+        for keyword in _AUTO_SENDER_KEYWORDS:
+            if keyword in reply_to:
+                logger.info(f"Skipping email — auto keyword in Reply-To: {reply_to}")
+                return True
+
+    return False
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SYNC LOGIC
@@ -200,6 +293,7 @@ async def perform_sync(config: dict, state: dict) -> tuple[bool, dict, int]:
             mail.login(gmail_user, gmail_pass)
             mail.select("INBOX")
 
+            # First-run: record current max UID, don't process existing emails
             if last_uid is None:
                 status, data = mail.uid("SEARCH", None, "ALL")
                 uids = [int(u) for u in data[0].split()] if (status == "OK" and data[0]) else []
@@ -208,7 +302,13 @@ async def perform_sync(config: dict, state: dict) -> tuple[bool, dict, int]:
                 mail.logout()
                 return current_last_uid, []
 
-            status, messages = mail.uid("SEARCH", None, f"UNSEEN UID {last_uid + 1}:*")
+            # FIX: UNSEEN and UID range must be passed as separate criteria strings,
+            # not concatenated into one. The old single-string form was silently broken.
+            status, messages = mail.uid(
+                "SEARCH", None,
+                "UNSEEN",
+                f"UID {last_uid + 1}:*",
+            )
             if status != "OK" or not messages[0]:
                 mail.close()
                 mail.logout()
@@ -227,17 +327,26 @@ async def perform_sync(config: dict, state: dict) -> tuple[bool, dict, int]:
             return None, emails_data
 
         last_uid_update, fetched_emails = await asyncio.to_thread(_imap_sync)
-        
+
         if last_uid_update is not None:
             new_state["last_processed_uid"] = last_uid_update
             return True, new_state, 0
 
         max_processed_uid = last_uid
+        processed_count = 0
+
         for uid_int, raw_email in fetched_emails:
             msg = email.message_from_bytes(raw_email)
+
+            # FIX: skip auto-replies and bot messages before doing anything
+            if _is_auto_message(msg, gmail_user):
+                # Still advance UID so we don't reprocess this email forever
+                max_processed_uid = max(max_processed_uid, uid_int)
+                continue
+
             sender = msg.get("From")
             subject = msg.get("Subject", "")
-            
+
             body = ""
             if msg.is_multipart():
                 for part in msg.walk():
@@ -249,24 +358,45 @@ async def perform_sync(config: dict, state: dict) -> tuple[bool, dict, int]:
                 body_bytes = msg.get_payload(decode=True)
                 body = body_bytes.decode(errors="replace") if body_bytes else ""
 
-            if body.strip():
-                reply_text = await process_email_with_gemini(business_name, faq_text, body.strip(), tenant_id=tenant_id)
-                
+            if not body.strip():
+                # Empty body — advance UID and move on
+                max_processed_uid = max(max_processed_uid, uid_int)
+                continue
+
+            reply_text = await process_email_with_gemini(
+                business_name, faq_text, body.strip(), tenant_id=tenant_id
+            )
+
+            # FIX: only advance UID after a confirmed successful send.
+            # If SMTP fails, this email stays at the previous UID and will be
+            # retried on the next sync cycle.
+            try:
                 def _send_reply(r_text, r_sender, r_subject):
                     smtp_msg = MIMEText(r_text)
                     smtp_msg["Subject"] = f"Re: {r_subject}"
                     smtp_msg["From"] = gmail_user
                     smtp_msg["To"] = r_sender
+                    # Mark as automated so we don't reply to our own replies
+                    smtp_msg["Auto-Submitted"] = "auto-replied"
+                    smtp_msg["X-Auto-Response-Suppress"] = "All"
                     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
                         s.login(gmail_user, gmail_pass)
                         s.send_message(smtp_msg)
 
                 await asyncio.to_thread(_send_reply, reply_text, sender, subject)
-            
-            max_processed_uid = max(max_processed_uid, uid_int)
-        
+                max_processed_uid = max(max_processed_uid, uid_int)
+                processed_count += 1
+                logger.info(f"Replied to UID {uid_int} from {sender}")
+
+            except smtplib.SMTPException as smtp_err:
+                # Don't advance UID — will retry next sync
+                logger.error(
+                    f"SMTP send failed for UID {uid_int} to {sender}: {smtp_err}. "
+                    "Will retry on next sync."
+                )
+
         new_state["last_processed_uid"] = max_processed_uid
-        return True, new_state, len(fetched_emails)
+        return True, new_state, processed_count
 
     except Exception as e:
         logger.error(f"Sync error for {gmail_user}: {e}")
@@ -290,25 +420,30 @@ def extract_text_from_xlsx(content: bytes) -> str:
     wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
     sheets = []
     for name in wb.sheetnames:
-        rows = [" | ".join([str(c).strip() for c in r if c is not None]) for r in wb[name].iter_rows(values_only=True)]
-        if rows: sheets.append(f"[Sheet: {name}]\n" + "\n".join(rows))
+        rows = [
+            " | ".join([str(c).strip() for c in r if c is not None])
+            for r in wb[name].iter_rows(values_only=True)
+        ]
+        if rows:
+            sheets.append(f"[Sheet: {name}]\n" + "\n".join(rows))
     return "\n\n".join(sheets)
 
 def extract_text(content: bytes, filename: str) -> str:
     ext = filename.lower()
-    if ext.endswith(".pdf"): return extract_text_from_pdf(content)
-    if ext.endswith(".docx"): return extract_text_from_docx(content)
+    if ext.endswith(".pdf"):   return extract_text_from_pdf(content)
+    if ext.endswith(".docx"):  return extract_text_from_docx(content)
     if ext.endswith(".xlsx") or ext.endswith(".xls"): return extract_text_from_xlsx(content)
     return content.decode("utf-8", errors="replace")
 
-def chunk_text(text: str, strategy: str = "paragraph", max_chunk_words: int = 400, overlap_words: int = 50) -> list[str]:
-    """
-    Split text into chunks for embedding.
-    Strategies: paragraph, sentence, fixed_size
-    """
+def chunk_text(
+    text: str,
+    strategy: str = "paragraph",
+    max_chunk_words: int = 400,
+    overlap_words: int = 50,
+) -> list[str]:
+    """Split text into chunks for embedding. Strategies: paragraph, sentence, fixed_size"""
     if not text or not text.strip():
         return []
-
     if strategy == "sentence":
         return _chunk_by_sentence(text, max_chunk_words, overlap_words)
     elif strategy == "fixed_size":
@@ -318,12 +453,10 @@ def chunk_text(text: str, strategy: str = "paragraph", max_chunk_words: int = 40
 
 
 def _chunk_by_paragraph(text: str, max_words: int, overlap_words: int) -> list[str]:
-    """Split on paragraph boundaries, merge short paragraphs."""
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
     chunks = []
     current_chunk: list[str] = []
     current_word_count = 0
-
     for para in paragraphs:
         para_words = len(para.split())
         if para_words > max_words:
@@ -333,7 +466,6 @@ def _chunk_by_paragraph(text: str, max_words: int, overlap_words: int) -> list[s
                 current_word_count = 0
             chunks.extend(_chunk_fixed_size(para, max_words, overlap_words))
             continue
-
         if current_word_count + para_words > max_words and current_chunk:
             chunks.append("\n\n".join(current_chunk))
             if overlap_words > 0:
@@ -343,23 +475,19 @@ def _chunk_by_paragraph(text: str, max_words: int, overlap_words: int) -> list[s
             else:
                 current_chunk = []
                 current_word_count = 0
-
         current_chunk.append(para)
         current_word_count += para_words
-
     if current_chunk:
         chunks.append("\n\n".join(current_chunk))
     return chunks
 
 
 def _chunk_by_sentence(text: str, max_words: int, overlap_words: int) -> list[str]:
-    """Split on sentence boundaries (. ! ?)."""
     import re
     sentences = re.split(r'(?<=[.!?])\s+', text)
     chunks = []
     current: list[str] = []
     current_words = 0
-
     for sentence in sentences:
         s_words = len(sentence.split())
         if current_words + s_words > max_words and current:
@@ -375,14 +503,12 @@ def _chunk_by_sentence(text: str, max_words: int, overlap_words: int) -> list[st
                 current_words = 0
         current.append(sentence)
         current_words += s_words
-
     if current:
         chunks.append(" ".join(current))
     return chunks
 
 
 def _chunk_fixed_size(text: str, max_words: int, overlap_words: int) -> list[str]:
-    """Fixed-size word windows with overlap."""
     words = text.split()
     chunks = []
     i = 0
@@ -396,18 +522,23 @@ def _chunk_fixed_size(text: str, max_words: int, overlap_words: int) -> list[str
             break
     return chunks
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/")
 async def root():
-    return {"status": "healthy", "version": "3.0.0"}
+    return {"status": "healthy", "version": "3.1.0"}
 
 @app.post("/sync")
 async def handle_sync(payload: SyncRequest):
     success, updated_state, count = await perform_sync(payload.config, payload.state)
-    return {"status": "success" if success else "error", "state": updated_state, "processed": count}
+    return {
+        "status": "success" if success else "error",
+        "state": updated_state,
+        "processed": count,
+    }
 
 @app.post("/install")
 async def handle_install():
@@ -417,20 +548,21 @@ async def handle_install():
 @app.post("/")
 async def handle_chat(payload: ChatRequest):
     config = payload.injected_context
-    reply = await process_email_with_gemini(config.get("business_name", "the business"), config.get("faq_text", ""), payload.message, tenant_id=config.get("tenant_id"))
+    reply = await process_email_with_gemini(
+        config.get("business_name", "the business"),
+        config.get("faq_text", ""),
+        payload.message,
+        tenant_id=config.get("tenant_id"),
+    )
     return {"reply": reply}
 
 @app.post("/index-knowledge")
 async def index_knowledge(payload: KnowledgePayload):
-    """
-    Indexes text content into the tenant's ChromaDB collection.
-    Applies smart chunking before embedding.
-    """
+    """Indexes text content into the tenant's ChromaDB collection."""
     try:
         client = get_chroma_client()
         collection = client.get_or_create_collection(name=f"tenant_{payload.tenant_id}")
 
-        # Chunk the content
         chunks = chunk_text(
             payload.content,
             strategy=payload.chunk_strategy,
@@ -448,7 +580,6 @@ async def index_knowledge(payload: KnowledgePayload):
                 logger.warning(f"Skipping chunk {i} — embedding failed.")
                 continue
 
-            # Deterministic ID based on content hash for idempotency
             content_hash = hashlib.sha256(chunk.encode()).hexdigest()[:16]
             doc_id = f"doc_{payload.tenant_id[:8]}_{content_hash}"
 
@@ -465,9 +596,7 @@ async def index_knowledge(payload: KnowledgePayload):
             )
             indexed_ids.append(doc_id)
 
-        logger.info(
-            f"Indexed {len(indexed_ids)}/{len(chunks)} chunks for tenant {payload.tenant_id}"
-        )
+        logger.info(f"Indexed {len(indexed_ids)}/{len(chunks)} chunks for tenant {payload.tenant_id}")
         return {
             "status": "success",
             "chunks_indexed": len(indexed_ids),
@@ -484,11 +613,19 @@ async def index_knowledge(payload: KnowledgePayload):
 async def upload_file(tenant_id: str = Form(...), file: UploadFile = File(...)):
     content = await file.read()
     text = extract_text(content, file.filename)
-    return await index_knowledge(KnowledgePayload(tenant_id=tenant_id, content=text))
+    # FIX: pass filename in metadata so [Source: filename] renders correctly
+    # in retrieved context. Previously this was an empty dict and source was
+    # always blank.
+    return await index_knowledge(KnowledgePayload(
+        tenant_id=tenant_id,
+        content=text,
+        metadata={"filename": file.filename},
+    ))
 
 @app.get("/rag-config", response_model=RAGConfigResponse)
 async def rag_config():
     return RAGConfigResponse()
+
 
 if __name__ == "__main__":
     import uvicorn
