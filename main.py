@@ -14,8 +14,6 @@ import os
 import io
 import yaml
 import asyncio
-from firebase_admin import credentials, firestore, initialize_app
-from cryptography.fernet import Fernet
 import time
 import imaplib
 import smtplib
@@ -61,28 +59,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 CHROMA_DATA_PATH = os.path.join(os.getcwd(), "knowledge_data") # Persistent storage
 os.makedirs(CHROMA_DATA_PATH, exist_ok=True)
 
-# ── Encryption & Database ───────────────────────────────────────────────────
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
-if not ENCRYPTION_KEY:
-    # Fallback/Development key — in production, this MUST be in .env
-    ENCRYPTION_KEY = b'v-9R6R_O9v6R8_U9v6R8_U9v6R8_U9v6R8_U9v6R8_U='
-
-cipher_suite = Fernet(ENCRYPTION_KEY)
-
-# Initialize Firebase
-try:
-    # Use default credentials (Service Account) if available, else look for key file
-    initialize_app()
-except Exception:
-    pass # Already initialized or handled by environment
-
-db = firestore.client()
-
-def decrypt_value(encrypted_value: str) -> str:
-    try:
-        return cipher_suite.decrypt(encrypted_value.encode()).decode()
-    except Exception:
-        return encrypted_value # Return as-is if not encrypted
+# ── ChromaDB Initialization ─────────────────────────────────────────────────
 _chroma_client = None
 
 def get_chroma_client():
@@ -512,71 +489,6 @@ async def upload_file(tenant_id: str = Form(...), file: UploadFile = File(...)):
 @app.get("/rag-config", response_model=RAGConfigResponse)
 async def rag_config():
     return RAGConfigResponse()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# AUTONOMOUS BACKGROUND MONITORING
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def autonomous_monitoring_loop():
-    """
-    Background task that periodically checks all active tenants assigned to this agent.
-    """
-    logger.info("Starting Autonomous Background Monitor...")
-    agent_id = os.getenv("AGENT_ID", "email-support-agent")
-    
-    while True:
-        try:
-            # 1. Fetch all active tenants for THIS agent
-            tenants_ref = db.collection("tenants").where("agent_id", "==", agent_id).where("status", "==", "active")
-            docs = tenants_ref.stream()
-            
-            for doc in docs:
-                tenant_id = doc.id
-                data = doc.to_dict()
-                
-                # 2. Decrypt config
-                config = data.get("config", {})
-                decrypted_config = {}
-                for key, value in config.items():
-                    is_sensitive = any(word in key.lower() for word in ["password", "key", "token", "secret"])
-                    if is_sensitive and isinstance(value, str):
-                        decrypted_val = decrypt_value(value)
-                        # Sanitize gmail app passwords
-                        if "gmail_app_password" in key:
-                            decrypted_val = decrypted_val.replace(" ", "").strip()
-                        decrypted_config[key] = decrypted_val
-                    else:
-                        decrypted_config[key] = value
-                
-                decrypted_config["tenant_id"] = tenant_id
-                
-                # 3. Perform Sync
-                logger.info(f"Background Sync: Checking inbox for tenant {tenant_id}...")
-                current_state = data.get("state", {})
-                
-                # Run the same logic as the /sync endpoint
-                success, new_state, processed_count = await perform_sync(decrypted_config, current_state)
-                
-                if success and (new_state != current_state or processed_count > 0):
-                    # Update state in Firestore
-                    db.collection("tenants").document(tenant_id).update({
-                        "state": new_state,
-                        "metrics.last_called_at": firestore.SERVER_TIMESTAMP
-                    })
-                    if processed_count > 0:
-                        logger.info(f"Background Sync: Processed {processed_count} emails for {tenant_id}")
-            
-        except Exception as e:
-            logger.error(f"Autonomous Monitor Error: {e}")
-            
-        # Poll interval (every 60 seconds)
-        await asyncio.sleep(60)
-
-@app.on_event("startup")
-async def startup_event():
-    # Start the background monitor when the app starts
-    asyncio.create_task(autonomous_monitoring_loop())
 
 if __name__ == "__main__":
     import uvicorn
