@@ -528,6 +528,7 @@ def _chunk_fixed_size(text: str, max_words: int, overlap_words: int) -> list[str
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/")
+@app.get("/health")
 async def root():
     return {"status": "healthy", "version": "3.1.0"}
 
