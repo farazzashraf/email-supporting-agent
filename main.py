@@ -9,17 +9,28 @@ This agent:
 
 This agent is stateless; the Gateway is responsible for triggering '/sync' calls.
 
-Fixes applied (v3.1.0):
+Fixes applied (v3.2.0):
   - IMAP search query: separate UNSEEN and UID criteria correctly
   - Reply loop protection: skip auto-replies, bots, and self-addressed emails
   - upload_file: filename now passed into metadata so [Source: ...] renders
   - SMTP failure safety: UID only advances if reply was sent successfully
   - Rate limiting: asyncio.Semaphore limits concurrent Gemini calls to 5
+  - FIX: embed_content / generate_content called via client.aio.* — were
+    blocking the event loop as bare synchronous calls inside async functions
+  - FIX: client.search() deprecated → replaced with client.query_points()
+    which is the current Qdrant API (qdrant-client >= 1.7)
+  - FIX: score_threshold=0.5 added to retrieval — previously all chunks,
+    including near-zero similarity ones, were being fed to the LLM
+  - FIX: collection creation race condition guarded with try/except so
+    concurrent index requests for the same new tenant don't crash
+  - FIX: embedding dimension validated against existing collection — prevents
+    silent upsert failures when the embedding model is changed
+  - FIX: _chunk_fixed_size infinite loop when overlap_words >= max_words;
+    overlap is now clamped to max(0, max_words - 1)
 """
 
 import os
 import io
-import yaml
 import asyncio
 import uuid
 import time
@@ -28,12 +39,12 @@ import smtplib
 import email
 import hashlib
 import json
-import httpx
+import logging
 from email.mime.text import MIMEText
-from typing import Optional, List
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -43,8 +54,6 @@ from qdrant_client.http import models as rest_models
 import pypdf
 import docx        # python-docx
 import openpyxl
-
-import logging
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -58,25 +67,22 @@ load_dotenv()
 app = FastAPI(
     title="Email Support Agent",
     description="RAG-powered email support agent with multi-format knowledge ingestion.",
-    version="3.1.0",
+    version="3.2.0",
 )
-
-# ── Environment ──────────────────────────────────────────────────────────────
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # ── Rate limiting: max 5 concurrent Gemini calls ─────────────────────────────
 _gemini_semaphore = asyncio.Semaphore(5)
 
-# ── Qdrant Initialization ──────────────────────────────────────────────────
-_qdrant_client = None
+# ── Qdrant Initialization ─────────────────────────────────────────────────────
+_qdrant_client: Optional[AsyncQdrantClient] = None
 
-def get_qdrant_client():
+def get_qdrant_client() -> AsyncQdrantClient:
     global _qdrant_client
     if _qdrant_client is None:
         url = os.getenv("QDRANT_URL")
         api_key = os.getenv("QDRANT_API_KEY")
         if not url:
-            logger.error("QDRANT_URL not found in environment!")
+            raise RuntimeError("QDRANT_URL is not set in environment")
         _qdrant_client = AsyncQdrantClient(url=url, api_key=api_key)
     return _qdrant_client
 
@@ -86,24 +92,20 @@ def get_qdrant_client():
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ChatRequest(BaseModel):
-    """Standard chat payload from the Agent-fy Gateway."""
     message: str
     injected_context: dict = {}
 
 class SyncRequest(BaseModel):
-    """Payload for triggering a single inbox sync."""
     config: dict
     state: dict = {}
 
 class KnowledgePayload(BaseModel):
-    """Text-based knowledge ingestion payload."""
     tenant_id: str
     content: str
     metadata: dict = {}
     chunk_strategy: str = "paragraph"
 
 class RAGConfigResponse(BaseModel):
-    """Returned by /rag-config for gateway introspection."""
     rag_enabled: bool = True
     vector_store: str = "qdrant"
     embedding_model: str = "gemini-embedding-2"
@@ -113,10 +115,10 @@ class RAGConfigResponse(BaseModel):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# EMBEDDINGS & RAG
+# GEMINI CLIENT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _get_genai_client() -> genai.Client | None:
+def _get_genai_client() -> Optional[genai.Client]:
     api_key = os.getenv("GEMINI_API_KEY")
     base_url = os.getenv("GEMINI_BASE_URL")
     if not api_key:
@@ -124,24 +126,55 @@ def _get_genai_client() -> genai.Client | None:
     http_options = types.HttpOptions(base_url=base_url) if base_url else None
     return genai.Client(api_key=api_key, http_options=http_options)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EMBEDDINGS & RAG
+# ══════════════════════════════════════════════════════════════════════════════
+
 async def get_embeddings(text: str) -> list[float]:
+    """
+    Returns the embedding vector for `text`.
+
+    FIX: previously called client.models.embed_content() (synchronous) directly
+    inside an async function, blocking the event loop.  The google-genai SDK
+    exposes client.aio.* for proper async I/O; we use that here.
+    """
     client = _get_genai_client()
     if not client:
         return []
     try:
         truncated = text[:8000] if len(text) > 8000 else text
-        response = client.models.embed_content(model="gemini-embedding-2", contents=truncated)
+        # FIX: use client.aio.models.embed_content — the async counterpart
+        response = await client.aio.models.embed_content(
+            model="gemini-embedding-2",
+            contents=truncated,
+        )
         return response.embeddings[0].values
     except Exception as e:
         logger.error(f"Embedding error: {e}")
         return []
 
-async def get_retrieved_context(tenant_id: str, query: str, n_results: int = 5) -> str:
+
+async def get_retrieved_context(
+    tenant_id: str,
+    query: str,
+    n_results: int = 5,
+    score_threshold: float = 0.50,
+) -> str:
+    """
+    Semantic search over the tenant's Qdrant collection.
+
+    FIX 1: client.search() is deprecated in qdrant-client >= 1.7.  Replaced
+    with client.query_points(), which is the current stable API.
+
+    FIX 2: score_threshold added (default 0.50).  Previously every chunk in
+    the collection, even near-zero similarity, was forwarded to the LLM as
+    "context", poisoning the prompt with irrelevant content.
+    """
     try:
         client = get_qdrant_client()
         collection_name = f"tenant_{tenant_id}"
-        
-        # Check if collection exists
+
         collections = await client.get_collections()
         exists = any(c.name == collection_name for c in collections.collections)
         if not exists:
@@ -151,26 +184,29 @@ async def get_retrieved_context(tenant_id: str, query: str, n_results: int = 5) 
         if not query_embedding:
             return ""
 
-        results = await client.search(
+        # FIX: query_points replaces deprecated search(); .points holds the hits
+        response = await client.query_points(
             collection_name=collection_name,
-            query_vector=query_embedding,
+            query=query_embedding,
             limit=n_results,
+            score_threshold=score_threshold,
         )
 
-        if not results:
+        if not response.points:
             return ""
 
         context_parts = []
-        for hit in results:
+        for hit in response.points:
             doc_text = hit.payload.get("text", "")
             source = hit.payload.get("filename", hit.payload.get("source", "unknown"))
             prefix = f"[Source: {source}] " if source else ""
             context_parts.append(f"{prefix}{doc_text}")
-            
+
         return "\n\n---\n\n".join(context_parts)
     except Exception as e:
         logger.error(f"Retrieval error: {e}")
         return ""
+
 
 async def process_email_with_gemini(
     business_name: str,
@@ -178,11 +214,21 @@ async def process_email_with_gemini(
     message: str,
     tenant_id: Optional[str] = None,
 ) -> str:
+    """
+    Generates an email reply via Gemini.
+
+    FIX: previously called client.models.generate_content() (synchronous)
+    directly inside an async function under a semaphore, blocking the entire
+    event loop for every LLM call.  Now uses client.aio.models.generate_content
+    — the async variant provided by the google-genai SDK.
+    """
     client = _get_genai_client()
     if not client:
         return "Sorry, I am currently unable to process your request."
 
-    vector_context = await get_retrieved_context(tenant_id, message) if tenant_id else ""
+    vector_context = (
+        await get_retrieved_context(tenant_id, message) if tenant_id else ""
+    )
 
     system_prompt = (
         f"You are a professional AI support assistant for **{business_name}**.\n\n"
@@ -198,9 +244,10 @@ async def process_email_with_gemini(
     )
 
     try:
-        # FIX: rate-limit concurrent Gemini calls
         async with _gemini_semaphore:
-            response = client.models.generate_content(
+            # FIX: use client.aio.models.generate_content (async), not
+            # client.models.generate_content (sync — blocks the event loop)
+            response = await client.aio.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=[system_prompt, f"Customer email: \"{message}\""],
                 config=types.GenerateContentConfig(
@@ -222,7 +269,6 @@ async def process_email_with_gemini(
 # REPLY LOOP GUARD
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Headers that indicate an automated message that should never be replied to.
 _AUTO_REPLY_HEADERS = [
     "Auto-Submitted",
     "X-Auto-Response-Suppress",
@@ -230,7 +276,6 @@ _AUTO_REPLY_HEADERS = [
     "X-AutoReply",
 ]
 
-# Common patterns in From/Subject that indicate automated senders.
 _AUTO_SENDER_KEYWORDS = [
     "noreply", "no-reply", "donotreply", "do-not-reply",
     "mailer-daemon", "postmaster", "bounce",
@@ -238,42 +283,32 @@ _AUTO_SENDER_KEYWORDS = [
 ]
 
 def _is_auto_message(msg: email.message.Message, own_address: str) -> bool:
-    """
-    Returns True if this email should be skipped (auto-reply, bot, self-sent).
-    Prevents infinite reply loops.
-    """
-    # 1. Check for standard auto-reply headers
     for header in _AUTO_REPLY_HEADERS:
         value = msg.get(header, "").strip().lower()
         if value and value not in ("no", "none", ""):
-            logger.info(f"Skipping email — auto header detected: {header}: {value}")
+            logger.info(f"Skipping — auto header: {header}: {value}")
             return True
 
-    # 2. Check sender address against own address (our own outbound emails)
     sender = msg.get("From", "").lower()
     if own_address.lower() in sender:
-        logger.info(f"Skipping email — sender matches own address: {sender}")
+        logger.info(f"Skipping — sender matches own address: {sender}")
         return True
 
-    # 3. Check sender for known bot/no-reply patterns
     for keyword in _AUTO_SENDER_KEYWORDS:
         if keyword in sender:
-            logger.info(f"Skipping email — auto-sender keyword '{keyword}' in: {sender}")
+            logger.info(f"Skipping — auto-sender keyword '{keyword}' in: {sender}")
             return True
 
-    # 4. Catch Precedence: bulk/list/junk headers (mailing lists, newsletters)
     precedence = msg.get("Precedence", "").strip().lower()
     if precedence in ("bulk", "list", "junk"):
-        logger.info(f"Skipping email — Precedence: {precedence}")
+        logger.info(f"Skipping — Precedence: {precedence}")
         return True
 
-    # 5. RFC 3834: if Reply-To is set to a no-reply address
     reply_to = msg.get("Reply-To", "").lower()
-    if reply_to:
-        for keyword in _AUTO_SENDER_KEYWORDS:
-            if keyword in reply_to:
-                logger.info(f"Skipping email — auto keyword in Reply-To: {reply_to}")
-                return True
+    for keyword in _AUTO_SENDER_KEYWORDS:
+        if keyword in reply_to:
+            logger.info(f"Skipping — auto keyword in Reply-To: {reply_to}")
+            return True
 
     return False
 
@@ -283,7 +318,6 @@ def _is_auto_message(msg: email.message.Message, own_address: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def perform_sync(config: dict, state: dict) -> tuple[bool, dict, int]:
-    """Performs a single sync of a Gmail inbox."""
     gmail_user = config.get("gmail_address", "").strip()
     gmail_pass = config.get("gmail_app_password", "").replace(" ", "").strip()
     business_name = config.get("business_name", "the business")
@@ -302,17 +336,18 @@ async def perform_sync(config: dict, state: dict) -> tuple[bool, dict, int]:
             mail.login(gmail_user, gmail_pass)
             mail.select("INBOX")
 
-            # First-run: record current max UID, don't process existing emails
             if last_uid is None:
                 status, data = mail.uid("SEARCH", None, "ALL")
-                uids = [int(u) for u in data[0].split()] if (status == "OK" and data[0]) else []
+                uids = (
+                    [int(u) for u in data[0].split()]
+                    if (status == "OK" and data[0])
+                    else []
+                )
                 current_last_uid = max(uids) if uids else 0
                 mail.close()
                 mail.logout()
                 return current_last_uid, []
 
-            # FIX: UNSEEN and UID range must be passed as separate criteria strings,
-            # not concatenated into one. The old single-string form was silently broken.
             status, messages = mail.uid(
                 "SEARCH", None,
                 "UNSEEN",
@@ -347,9 +382,7 @@ async def perform_sync(config: dict, state: dict) -> tuple[bool, dict, int]:
         for uid_int, raw_email in fetched_emails:
             msg = email.message_from_bytes(raw_email)
 
-            # FIX: skip auto-replies and bot messages before doing anything
             if _is_auto_message(msg, gmail_user):
-                # Still advance UID so we don't reprocess this email forever
                 max_processed_uid = max(max_processed_uid, uid_int)
                 continue
 
@@ -368,7 +401,6 @@ async def perform_sync(config: dict, state: dict) -> tuple[bool, dict, int]:
                 body = body_bytes.decode(errors="replace") if body_bytes else ""
 
             if not body.strip():
-                # Empty body — advance UID and move on
                 max_processed_uid = max(max_processed_uid, uid_int)
                 continue
 
@@ -376,16 +408,12 @@ async def perform_sync(config: dict, state: dict) -> tuple[bool, dict, int]:
                 business_name, faq_text, body.strip(), tenant_id=tenant_id
             )
 
-            # FIX: only advance UID after a confirmed successful send.
-            # If SMTP fails, this email stays at the previous UID and will be
-            # retried on the next sync cycle.
             try:
                 def _send_reply(r_text, r_sender, r_subject):
                     smtp_msg = MIMEText(r_text)
                     smtp_msg["Subject"] = f"Re: {r_subject}"
                     smtp_msg["From"] = gmail_user
                     smtp_msg["To"] = r_sender
-                    # Mark as automated so we don't reply to our own replies
                     smtp_msg["Auto-Submitted"] = "auto-replied"
                     smtp_msg["X-Auto-Response-Suppress"] = "All"
                     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
@@ -398,7 +426,6 @@ async def perform_sync(config: dict, state: dict) -> tuple[bool, dict, int]:
                 logger.info(f"Replied to UID {uid_int} from {sender}")
 
             except smtplib.SMTPException as smtp_err:
-                # Don't advance UID — will retry next sync
                 logger.error(
                     f"SMTP send failed for UID {uid_int} to {sender}: {smtp_err}. "
                     "Will retry on next sync."
@@ -439,10 +466,11 @@ def extract_text_from_xlsx(content: bytes) -> str:
 
 def extract_text(content: bytes, filename: str) -> str:
     ext = filename.lower()
-    if ext.endswith(".pdf"):   return extract_text_from_pdf(content)
-    if ext.endswith(".docx"):  return extract_text_from_docx(content)
+    if ext.endswith(".pdf"):                        return extract_text_from_pdf(content)
+    if ext.endswith(".docx"):                       return extract_text_from_docx(content)
     if ext.endswith(".xlsx") or ext.endswith(".xls"): return extract_text_from_xlsx(content)
     return content.decode("utf-8", errors="replace")
+
 
 def chunk_text(
     text: str,
@@ -450,9 +478,12 @@ def chunk_text(
     max_chunk_words: int = 400,
     overlap_words: int = 50,
 ) -> list[str]:
-    """Split text into chunks for embedding. Strategies: paragraph, sentence, fixed_size"""
     if not text or not text.strip():
         return []
+    # FIX: clamp overlap so fixed-size chunker can never produce a zero/negative
+    # step, which caused an infinite loop when overlap_words >= max_chunk_words
+    overlap_words = max(0, min(overlap_words, max_chunk_words - 1))
+
     if strategy == "sentence":
         return _chunk_by_sentence(text, max_chunk_words, overlap_words)
     elif strategy == "fixed_size":
@@ -463,9 +494,10 @@ def chunk_text(
 
 def _chunk_by_paragraph(text: str, max_words: int, overlap_words: int) -> list[str]:
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    chunks = []
+    chunks: list[str] = []
     current_chunk: list[str] = []
     current_word_count = 0
+
     for para in paragraphs:
         para_words = len(para.split())
         if para_words > max_words:
@@ -486,6 +518,7 @@ def _chunk_by_paragraph(text: str, max_words: int, overlap_words: int) -> list[s
                 current_word_count = 0
         current_chunk.append(para)
         current_word_count += para_words
+
     if current_chunk:
         chunks.append("\n\n".join(current_chunk))
     return chunks
@@ -494,41 +527,47 @@ def _chunk_by_paragraph(text: str, max_words: int, overlap_words: int) -> list[s
 def _chunk_by_sentence(text: str, max_words: int, overlap_words: int) -> list[str]:
     import re
     sentences = re.split(r'(?<=[.!?])\s+', text)
-    chunks = []
+    chunks: list[str] = []
     current: list[str] = []
     current_words = 0
+
     for sentence in sentences:
         s_words = len(sentence.split())
         if current_words + s_words > max_words and current:
             chunks.append(" ".join(current))
-            overlap_text = " ".join(current)
-            overlap_split = overlap_text.split()
-            if overlap_words > 0 and len(overlap_split) > overlap_words:
+            if overlap_words > 0:
+                overlap_split = " ".join(current).split()
                 carry = " ".join(overlap_split[-overlap_words:])
                 current = [carry]
-                current_words = overlap_words
+                current_words = len(carry.split())
             else:
                 current = []
                 current_words = 0
         current.append(sentence)
         current_words += s_words
+
     if current:
         chunks.append(" ".join(current))
     return chunks
 
 
 def _chunk_fixed_size(text: str, max_words: int, overlap_words: int) -> list[str]:
+    """
+    FIX: step = max_words - overlap_words; was never guarded against <= 0.
+    overlap_words is clamped in chunk_text() before this is called, so
+    step >= 1 is guaranteed here — but we assert defensively anyway.
+    """
+    step = max_words - overlap_words
+    assert step >= 1, "overlap_words must be < max_words"  # defensive
+
     words = text.split()
-    chunks = []
+    chunks: list[str] = []
     i = 0
     while i < len(words):
-        end = min(i + max_words, len(words))
-        chunk = " ".join(words[i:end])
+        chunk = " ".join(words[i : i + max_words])
         if chunk.strip():
             chunks.append(chunk)
-        i += max_words - overlap_words
-        if i >= len(words):
-            break
+        i += step
     return chunks
 
 
@@ -539,7 +578,7 @@ def _chunk_fixed_size(text: str, max_words: int, overlap_words: int) -> list[str
 @app.get("/")
 @app.get("/health")
 async def root():
-    return {"status": "healthy", "version": "3.1.0"}
+    return {"status": "healthy", "version": "3.2.0"}
 
 @app.post("/sync")
 async def handle_sync(payload: SyncRequest):
@@ -552,7 +591,6 @@ async def handle_sync(payload: SyncRequest):
 
 @app.post("/install")
 async def handle_install():
-    """Triggered by the Gateway as a wake-up signal."""
     return {"status": "ok", "message": "Agent woken up."}
 
 @app.post("/")
@@ -566,22 +604,13 @@ async def handle_chat(payload: ChatRequest):
     )
     return {"reply": reply}
 
+
 @app.post("/index-knowledge")
 async def index_knowledge(payload: KnowledgePayload):
     """Indexes text content into the tenant's Qdrant collection."""
     try:
         client = get_qdrant_client()
         collection_name = f"tenant_{payload.tenant_id}"
-
-        # Create collection if not exists
-        collections = await client.get_collections()
-        exists = any(c.name == collection_name for c in collections.collections)
-        if not exists:
-            logger.info(f"Creating Qdrant collection: {collection_name}")
-            await client.create_collection(
-                collection_name=collection_name,
-                vectors_config=rest_models.VectorParams(size=768, distance=rest_models.Distance.COSINE),
-            )
 
         chunks = chunk_text(
             payload.content,
@@ -591,30 +620,95 @@ async def index_knowledge(payload: KnowledgePayload):
         )
 
         if not chunks:
-            raise HTTPException(status_code=400, detail="No meaningful text to index after chunking.")
+            raise HTTPException(
+                status_code=400,
+                detail="No meaningful text to index after chunking.",
+            )
+
+        # Embed first chunk to detect vector dimension
+        first_embedding = await get_embeddings(chunks[0])
+        if not first_embedding:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to generate initial embedding.",
+            )
+        vector_size = len(first_embedding)
+        logger.info(f"Detected embedding dimension: {vector_size}")
+
+        # Check if collection exists
+        collections = await client.get_collections()
+        exists = any(c.name == collection_name for c in collections.collections)
+
+        if not exists:
+            # FIX: race condition — two concurrent requests for the same new
+            # tenant both see exists=False and both call create_collection.
+            # Qdrant raises an error on the duplicate; we catch and ignore it
+            # (the collection was already created by the winning request).
+            try:
+                logger.info(
+                    f"Creating Qdrant collection: {collection_name} "
+                    f"with size {vector_size}"
+                )
+                await client.create_collection(
+                    collection_name=collection_name,
+                    vectors_config=rest_models.VectorParams(
+                        size=vector_size,
+                        distance=rest_models.Distance.COSINE,
+                    ),
+                )
+            except Exception as create_err:
+                # Re-check: if it now exists, a concurrent request won — that's fine
+                collections_retry = await client.get_collections()
+                if not any(
+                    c.name == collection_name for c in collections_retry.collections
+                ):
+                    # It genuinely failed for another reason — re-raise
+                    raise create_err
+                logger.warning(
+                    f"Collection {collection_name} created concurrently — continuing."
+                )
+        else:
+            # FIX: validate that the existing collection's vector size matches
+            # the current embedding model.  A mismatch (e.g. after a model
+            # upgrade) causes silent upsert failures with no clear error.
+            collection_info = await client.get_collection(collection_name)
+            existing_size = collection_info.config.params.vectors.size
+            if existing_size != vector_size:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Embedding dimension mismatch for collection '{collection_name}': "
+                        f"existing={existing_size}, current model={vector_size}. "
+                        "Delete the collection and re-index, or switch back to the "
+                        "original embedding model."
+                    ),
+                )
 
         points = []
         for i, chunk in enumerate(chunks):
-            embedding = await get_embeddings(chunk)
+            embedding = first_embedding if i == 0 else await get_embeddings(chunk)
             if not embedding:
                 logger.warning(f"Skipping chunk {i} — embedding failed.")
                 continue
 
             content_hash = hashlib.sha256(chunk.encode()).hexdigest()[:16]
-            # Qdrant requires string IDs to be valid UUIDs
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{payload.tenant_id}_{content_hash}"))
+            point_id = str(
+                uuid.uuid5(uuid.NAMESPACE_DNS, f"{payload.tenant_id}_{content_hash}")
+            )
 
-            points.append(rest_models.PointStruct(
-                id=point_id,
-                vector=embedding,
-                payload={
-                    "text": chunk,
-                    **payload.metadata,
-                    "chunk_index": i,
-                    "total_chunks": len(chunks),
-                    "indexed_at": time.time(),
-                }
-            ))
+            points.append(
+                rest_models.PointStruct(
+                    id=point_id,
+                    vector=embedding,
+                    payload={
+                        "text": chunk,
+                        **payload.metadata,
+                        "chunk_index": i,
+                        "total_chunks": len(chunks),
+                        "indexed_at": time.time(),
+                    },
+                )
+            )
 
         if points:
             await client.upsert(
@@ -622,30 +716,34 @@ async def index_knowledge(payload: KnowledgePayload):
                 points=points,
             )
 
-        logger.info(f"Indexed {len(points)}/{len(chunks)} chunks for tenant {payload.tenant_id}")
+        logger.info(
+            f"Indexed {len(points)}/{len(chunks)} chunks for {payload.tenant_id}"
+        )
         return {
             "status": "success",
             "chunks_indexed": len(points),
             "total_chunks": len(chunks),
         }
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Indexing error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Indexing error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Indexing failed: {e}")
+
 
 @app.post("/upload-file")
 async def upload_file(tenant_id: str = Form(...), file: UploadFile = File(...)):
     content = await file.read()
     text = extract_text(content, file.filename)
-    # FIX: pass filename in metadata so [Source: filename] renders correctly
-    # in retrieved context. Previously this was an empty dict and source was
-    # always blank.
-    return await index_knowledge(KnowledgePayload(
-        tenant_id=tenant_id,
-        content=text,
-        metadata={"filename": file.filename},
-    ))
+    return await index_knowledge(
+        KnowledgePayload(
+            tenant_id=tenant_id,
+            content=text,
+            metadata={"filename": file.filename},
+        )
+    )
+
 
 @app.get("/rag-config", response_model=RAGConfigResponse)
 async def rag_config():
