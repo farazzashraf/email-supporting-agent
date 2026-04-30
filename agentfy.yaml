@@ -46,7 +46,7 @@ installation_config:
 # RAG Configuration
 rag:
   enabled: true
-  vector_store: "chromadb"
+  vector_store: "qdrant"
   embedding_model: "gemini-embedding-2"
   supported_files:
     - ".pdf"

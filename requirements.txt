@@ -6,7 +6,7 @@ jinja2
 python-dotenv
 google-genai
 PyYAML
-chromadb
+qdrant-client
 pypdf
 python-docx
 openpyxl

@@ -3,7 +3,7 @@ Email Support Agent — Production RAG-powered email responder.
 
 This agent:
   1. Monitors a Gmail inbox for new emails via IMAP
-  2. Retrieves relevant context from a ChromaDB vector store (RAG)
+  2. Retrieves relevant context from a Qdrant vector store (RAG)
   3. Generates professional replies via Gemini 2.5 Flash
   4. Sends replies via SMTP
 
@@ -36,7 +36,8 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
-import chromadb
+from qdrant_client import AsyncQdrantClient
+from qdrant_client.http import models as rest_models
 
 import pypdf
 import docx        # python-docx
@@ -65,19 +66,18 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 # ── Rate limiting: max 5 concurrent Gemini calls ─────────────────────────────
 _gemini_semaphore = asyncio.Semaphore(5)
 
-# ── ChromaDB Initialization ─────────────────────────────────────────────────
-CHROMA_DATA_PATH = os.path.join(os.getcwd(), "knowledge_data")
-os.makedirs(CHROMA_DATA_PATH, exist_ok=True)
+# ── Qdrant Initialization ──────────────────────────────────────────────────
+_qdrant_client = None
 
-_chroma_client = None
-
-def get_chroma_client():
-    global _chroma_client
-    if _chroma_client is None:
-        logger.info(f"Initializing ChromaDB at {CHROMA_DATA_PATH}...")
-        os.makedirs(CHROMA_DATA_PATH, exist_ok=True)
-        _chroma_client = chromadb.PersistentClient(path=CHROMA_DATA_PATH)
-    return _chroma_client
+def get_qdrant_client():
+    global _qdrant_client
+    if _qdrant_client is None:
+        url = os.getenv("QDRANT_URL")
+        api_key = os.getenv("QDRANT_API_KEY")
+        if not url:
+            logger.error("QDRANT_URL not found in environment!")
+        _qdrant_client = AsyncQdrantClient(url=url, api_key=api_key)
+    return _qdrant_client
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -104,7 +104,7 @@ class KnowledgePayload(BaseModel):
 class RAGConfigResponse(BaseModel):
     """Returned by /rag-config for gateway introspection."""
     rag_enabled: bool = True
-    vector_store: str = "chromadb"
+    vector_store: str = "qdrant"
     embedding_model: str = "gemini-embedding-2"
     supported_files: list = [".pdf", ".docx", ".xlsx", ".txt"]
     chunk_strategy: str = "paragraph"
@@ -137,27 +137,35 @@ async def get_embeddings(text: str) -> list[float]:
 
 async def get_retrieved_context(tenant_id: str, query: str, n_results: int = 5) -> str:
     try:
-        client = get_chroma_client()
-        collection = client.get_or_create_collection(name=f"tenant_{tenant_id}")
-        if collection.count() == 0:
+        client = get_qdrant_client()
+        collection_name = f"tenant_{tenant_id}"
+        
+        # Check if collection exists
+        collections = await client.get_collections()
+        exists = any(c.name == collection_name for c in collections.collections)
+        if not exists:
             return ""
+
         query_embedding = await get_embeddings(query)
         if not query_embedding:
             return ""
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=min(n_results, collection.count()),
+
+        results = await client.search(
+            collection_name=collection_name,
+            query_vector=query_embedding,
+            limit=n_results,
         )
-        if not results["documents"] or not results["documents"][0]:
+
+        if not results:
             return ""
+
         context_parts = []
-        for i, doc_text in enumerate(results["documents"][0]):
-            source = ""
-            if results.get("metadatas") and results["metadatas"][0]:
-                meta = results["metadatas"][0][i]
-                source = meta.get("filename", meta.get("source", ""))
+        for hit in results:
+            doc_text = hit.payload.get("text", "")
+            source = hit.payload.get("filename", hit.payload.get("source", "unknown"))
             prefix = f"[Source: {source}] " if source else ""
             context_parts.append(f"{prefix}{doc_text}")
+            
         return "\n\n---\n\n".join(context_parts)
     except Exception as e:
         logger.error(f"Retrieval error: {e}")
@@ -559,10 +567,20 @@ async def handle_chat(payload: ChatRequest):
 
 @app.post("/index-knowledge")
 async def index_knowledge(payload: KnowledgePayload):
-    """Indexes text content into the tenant's ChromaDB collection."""
+    """Indexes text content into the tenant's Qdrant collection."""
     try:
-        client = get_chroma_client()
-        collection = client.get_or_create_collection(name=f"tenant_{payload.tenant_id}")
+        client = get_qdrant_client()
+        collection_name = f"tenant_{payload.tenant_id}"
+
+        # Create collection if not exists
+        collections = await client.get_collections()
+        exists = any(c.name == collection_name for c in collections.collections)
+        if not exists:
+            logger.info(f"Creating Qdrant collection: {collection_name}")
+            await client.create_collection(
+                collection_name=collection_name,
+                vectors_config=rest_models.VectorParams(size=768, distance=rest_models.Distance.COSINE),
+            )
 
         chunks = chunk_text(
             payload.content,
@@ -574,7 +592,7 @@ async def index_knowledge(payload: KnowledgePayload):
         if not chunks:
             raise HTTPException(status_code=400, detail="No meaningful text to index after chunking.")
 
-        indexed_ids = []
+        points = []
         for i, chunk in enumerate(chunks):
             embedding = await get_embeddings(chunk)
             if not embedding:
@@ -582,27 +600,31 @@ async def index_knowledge(payload: KnowledgePayload):
                 continue
 
             content_hash = hashlib.sha256(chunk.encode()).hexdigest()[:16]
-            doc_id = f"doc_{payload.tenant_id[:8]}_{content_hash}"
+            point_id = hashlib.md5(f"{payload.tenant_id}_{content_hash}".encode()).hexdigest()
 
-            collection.upsert(
-                ids=[doc_id],
-                embeddings=[embedding],
-                documents=[chunk],
-                metadatas=[{
+            points.append(rest_models.PointStruct(
+                id=point_id,
+                vector=embedding,
+                payload={
+                    "text": chunk,
                     **payload.metadata,
                     "chunk_index": i,
                     "total_chunks": len(chunks),
                     "indexed_at": time.time(),
-                }],
-            )
-            indexed_ids.append(doc_id)
+                }
+            ))
 
-        logger.info(f"Indexed {len(indexed_ids)}/{len(chunks)} chunks for tenant {payload.tenant_id}")
+        if points:
+            await client.upsert(
+                collection_name=collection_name,
+                points=points,
+            )
+
+        logger.info(f"Indexed {len(points)}/{len(chunks)} chunks for tenant {payload.tenant_id}")
         return {
             "status": "success",
-            "chunks_indexed": len(indexed_ids),
+            "chunks_indexed": len(points),
             "total_chunks": len(chunks),
-            "doc_ids": indexed_ids,
         }
     except HTTPException:
         raise
