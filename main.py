@@ -21,6 +21,7 @@ import os
 import io
 import yaml
 import asyncio
+import uuid
 import time
 import imaplib
 import smtplib
@@ -600,7 +601,8 @@ async def index_knowledge(payload: KnowledgePayload):
                 continue
 
             content_hash = hashlib.sha256(chunk.encode()).hexdigest()[:16]
-            point_id = hashlib.md5(f"{payload.tenant_id}_{content_hash}".encode()).hexdigest()
+            # Qdrant requires string IDs to be valid UUIDs
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{payload.tenant_id}_{content_hash}"))
 
             points.append(rest_models.PointStruct(
                 id=point_id,
