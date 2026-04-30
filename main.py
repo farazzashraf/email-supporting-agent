@@ -132,27 +132,30 @@ def _get_genai_client() -> Optional[genai.Client]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def get_embeddings(text: str) -> list[float]:
-    """
-    Returns the embedding vector for `text`.
-
-    FIX: previously called client.models.embed_content() (synchronous) directly
-    inside an async function, blocking the event loop.  The google-genai SDK
-    exposes client.aio.* for proper async I/O; we use that here.
-    """
     client = _get_genai_client()
     if not client:
         return []
-    try:
-        truncated = text[:8000] if len(text) > 8000 else text
-        # FIX: use client.aio.models.embed_content — the async counterpart
-        response = await client.aio.models.embed_content(
-            model="gemini-embedding-2",
-            contents=truncated,
-        )
-        return response.embeddings[0].values
-    except Exception as e:
-        logger.error(f"Embedding error: {e}")
-        return []
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            truncated = text[:8000] if len(text) > 8000 else text
+            response = await client.aio.models.embed_content(
+                model="gemini-embedding-2",
+                contents=truncated,
+            )
+            return response.embeddings[0].values
+        except Exception as e:
+            # Retry on transient errors (503, 429)
+            if "503" in str(e) or "429" in str(e):
+                wait_time = 2 ** attempt
+                logger.warning(f"Gemini 503/429 error. Retrying in {wait_time}s... (Attempt {attempt+1}/{max_retries})")
+                await asyncio.sleep(wait_time)
+                continue
+            
+            logger.error(f"Embedding error: {e}")
+            return []
+    return []
 
 
 async def get_retrieved_context(
@@ -245,21 +248,30 @@ async def process_email_with_gemini(
 
     try:
         async with _gemini_semaphore:
-            # FIX: use client.aio.models.generate_content (async), not
-            # client.models.generate_content (sync — blocks the event loop)
-            response = await client.aio.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[system_prompt, f"Customer email: \"{message}\""],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.5,
-                ),
-            )
-        text_resp = response.text.strip()
-        if text_resp.startswith("```json"):
-            text_resp = text_resp[7:-3].strip()
-        data = json.loads(text_resp)
-        return data.get("reply", "Thank you for your message.")
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    response = await client.aio.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=[system_prompt, f"Customer email: \"{message}\""],
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.5,
+                        ),
+                    )
+                    text_resp = response.text.strip()
+                    if text_resp.startswith("```json"):
+                        text_resp = text_resp[7:-3].strip()
+                    data = json.loads(text_resp)
+                    return data.get("reply", "Thank you for your message.")
+                except Exception as e:
+                    if ("503" in str(e) or "429" in str(e)) and attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        logger.warning(f"Gemini 503/429 error. Retrying in {wait_time}s... (Attempt {attempt+1}/{max_retries})")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    raise e
+
     except Exception as e:
         logger.error(f"Gemini error: {e}")
         return "Thank you for your message. We will get back to you shortly."
