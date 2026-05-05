@@ -259,6 +259,10 @@ async def process_email_with_gemini(
                             temperature=0.5,
                         ),
                     )
+                    if not response.text:
+                        logger.warning("Gemini returned an empty response (possibly blocked by safety filters).")
+                        return "Thank you for your message. We will get back to you shortly."
+
                     text_resp = response.text.strip()
                     if text_resp.startswith("```json"):
                         text_resp = text_resp[7:-3].strip()
@@ -371,7 +375,11 @@ async def perform_sync(config: dict, state: dict) -> tuple[bool, dict, int]:
                 return None, []
 
             emails_data = []
-            for e_uid in messages[0].split():
+            uids = messages[0].split()
+            # Batch limit: only process up to 10 emails per sync to avoid timeouts
+            batch_uids = uids[:10]
+            
+            for e_uid in batch_uids:
                 status, msg_data = mail.uid("FETCH", e_uid, "(RFC822)")
                 for response_part in msg_data:
                     if isinstance(response_part, tuple):
